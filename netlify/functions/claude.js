@@ -6,7 +6,7 @@ exports.handler = async function (event) {
   try {
     const body = JSON.parse(event.body);
 
-    // Image analysis - simple, no streaming, no tools
+    // Image analysis - simple, no tools
     if (body.content) {
       const response = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
@@ -29,19 +29,26 @@ exports.handler = async function (event) {
       };
     }
 
-    // Quiniela analysis with web search - handle full tool_use cycle
+    // Quiniela analysis - max 3 search turns then force answer
     const messages = body.messages || [];
     let fullText = '';
     let currentMessages = [...messages];
+    let searchCount = 0;
+    const MAX_SEARCHES = 3;
 
-    // Agentic loop: keep going until no more tool calls
-    for (let turn = 0; turn < 8; turn++) {
+    for (let turn = 0; turn < 6; turn++) {
       const requestBody = {
         model: "claude-sonnet-4-5",
         max_tokens: 4000,
         tools: [{ type: "web_search_20250305", name: "web_search" }],
         messages: currentMessages,
       };
+
+      // After max searches, force final answer with no tools
+      if (searchCount >= MAX_SEARCHES) {
+        delete requestBody.tools;
+        requestBody.tool_choice = undefined;
+      }
 
       const response = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
@@ -54,32 +61,26 @@ exports.handler = async function (event) {
       });
 
       const data = await response.json();
+      if (data.error) throw new Error(data.error.message);
 
-      if (data.error) {
-        throw new Error(data.error.message);
-      }
-
-      // Collect all text from this turn
       const textBlocks = (data.content || []).filter(b => b.type === 'text');
       fullText += textBlocks.map(b => b.text).join('');
 
-      // If no tool use, we're done
       const toolUseBlocks = (data.content || []).filter(b => b.type === 'tool_use');
-      if (toolUseBlocks.length === 0 || data.stop_reason === 'end_turn') {
-        break;
-      }
 
-      // Add assistant turn + tool results to continue
+      if (toolUseBlocks.length === 0 || data.stop_reason === 'end_turn') break;
+
+      searchCount += toolUseBlocks.length;
       currentMessages.push({ role: 'assistant', content: data.content });
+
       const toolResults = toolUseBlocks.map(tool => ({
         type: 'tool_result',
         tool_use_id: tool.id,
-        content: tool.input?.query ? `Búsqueda realizada: ${tool.input.query}` : 'OK',
+        content: tool.input?.query ? `Búsqueda: ${tool.input.query}` : 'OK',
       }));
       currentMessages.push({ role: 'user', content: toolResults });
     }
 
-    // Return as SSE stream format so frontend streaming parser works
     const sseData = `data: ${JSON.stringify({
       type: 'content_block_delta',
       delta: { type: 'text_delta', text: fullText }
